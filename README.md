@@ -9,6 +9,8 @@ Tested against Sophos free AV.
 
 Only for a sample of unhooking using a technique other than loading a second ntdll or using direct/inline syscalls.
 
+This sample also uses "GetModuleHandleA", but there's internal functions (e.g. get_module_by_name) that can replace it to further reduce Windows API usage.
+
 This repository consists of the following:
 
 - src\bin.rs
