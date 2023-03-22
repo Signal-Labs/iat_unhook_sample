@@ -19,3 +19,12 @@ This repository consists of the following:
     - Various helper functions for parsing in-memory PE32+ files 
 - src\pe_defs.rs
     - Additional types for PE32+ file parsing
+    
+    
+# Hooked vs Unhooked Comparison
+
+Hooked:
+![hooked_iat](https://user-images.githubusercontent.com/16039802/226813526-63c0278d-a6d8-4004-aed6-dc9cadf05d0d.png)
+
+Unhooked:
+![unhooked_iat](https://user-images.githubusercontent.com/16039802/226813548-d9b83110-64e4-42b9-8d5d-edd9205ff7f9.png)
