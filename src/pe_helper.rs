@@ -7,7 +7,7 @@ use crate::pe_helper::pe_def::{
 use alloc::sync::Arc;
 use core::arch::asm;
 use core::mem::transmute;
-use iced_x86::{Decoder, DecoderOptions, Instruction, OpKind, Register};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind, Register};
 use std::sync::Mutex;
 use windows::core::PCSTR;
 use windows::Win32::System::LibraryLoader::GetModuleHandleA;
@@ -62,7 +62,7 @@ pub fn unpatch_iat_hooks(hmod: &ModuleHandle64) -> Result<bool, PEHelperError> {
     // Get the start and end of ntdll which we use to check if the target of the iat entry is
     // within ntdll
     let ntdll_start = pe_file_ntdll.get_base_address();
-    let ndtll_end = ntdll_start + pe_file_ntdll.get_size();
+    let ntdll_end = ntdll_start + pe_file_ntdll.get_size();
 
     // Get exclusive access to the pe file
     let pe_lock = hmod.pe.lock().map_err(|_| PEHelperError::LockFailure)?;
@@ -86,7 +86,7 @@ pub fn unpatch_iat_hooks(hmod: &ModuleHandle64) -> Result<bool, PEHelperError> {
     for iat_entry in iat.addresses.iter() {
         // Ensure the target is within ntdll, otherwise its another module or potentially uninitialized
         if iat_entry.target_function_address < (ntdll_start as u64)
-            || iat_entry.target_function_address > (ndtll_end as u64)
+            || iat_entry.target_function_address > (ntdll_end as u64)
         {
             continue;
         }
@@ -94,7 +94,7 @@ pub fn unpatch_iat_hooks(hmod: &ModuleHandle64) -> Result<bool, PEHelperError> {
             "IAT address :{:#x}, target: {:#x}",
             iat_entry.iat_entry_address, iat_entry.target_function_address
         );
-        let result = unhook_iat_entry(iat_entry)?;
+        let result = unhook_iat_entry(iat_entry, ntdll_start as u64, ntdll_end as u64)?;
         if result {
             println!(
                 "Unhooked iat entry at {:x}, orig_target:{:#x}",
@@ -109,7 +109,11 @@ pub fn unpatch_iat_hooks(hmod: &ModuleHandle64) -> Result<bool, PEHelperError> {
 /// Takes an iat_entry, disassembles the target function to determine if its hooked,
 /// if it is, it will unhook it and return Ok(true), if it is not hooked, it will return Ok(false),
 /// if an error occurs, it will return Err.
-fn unhook_iat_entry(iat_entry: &ImportAddressEntry) -> Result<bool, PEHelperError> {
+fn unhook_iat_entry(
+    iat_entry: &ImportAddressEntry,
+    ntdll_start: u64,
+    ntdll_end: u64,
+) -> Result<bool, PEHelperError> {
     let target_addr = iat_entry.target_function_address;
     let replace_addr = iat_entry.iat_entry_address;
     // Ensure the addresses are at least non-zero
@@ -120,7 +124,7 @@ fn unhook_iat_entry(iat_entry: &ImportAddressEntry) -> Result<bool, PEHelperErro
     // Define the buffer of bytes to disassemble, we will disassemble 512-bytes at a time.
     // This is unsafe as we do little to no bounds checking.
 
-    let target_len = 512;
+    let target_len = 0x4000;
 
     // We loop until we patch the hook or reach the end of our analysis for this target address.
     let target_bytes = unsafe { std::slice::from_raw_parts(target_addr as *const u8, target_len) };
@@ -139,7 +143,7 @@ fn unhook_iat_entry(iat_entry: &ImportAddressEntry) -> Result<bool, PEHelperErro
     if instruction.code().op_code().mnemonic() != iced_x86::Mnemonic::Jmp {
         return Ok(false);
     }
-    println!("Found hook\n");
+    println!("Found jmp hook\n");
     // Now change the decoder to decode the target of the jmp
     let target = instruction.near_branch_target();
     println!("Stage 1 jmp target: {:#x}", target);
@@ -188,9 +192,19 @@ fn unhook_iat_entry(iat_entry: &ImportAddressEntry) -> Result<bool, PEHelperErro
         if instruction.op_kind(0) == OpKind::Register && instruction.op_register(0) == Register::RAX
         {
             if instruction.op_kind(1) == OpKind::Memory {
-                println!("Found RAX indirect load");
-                rax_indirect_load = Some(instruction.memory_displacement64());
-                instr_since_rax = 1;
+                println!(
+                    "Found RAX indirect load at instruction addr: {:#x}",
+                    instruction.ip()
+                );
+                let displacement = instruction.memory_displacement64();
+                if displacement < 0x10000 || displacement > 0x7FFF_FFFF_FFFF_FFFF {
+                    // This is not a valid address, ignore it
+                    rax_indirect_load = None;
+                    instr_since_rax = 0;
+                } else {
+                    rax_indirect_load = Some(displacement);
+                    instr_since_rax = 1;
+                }
             } else {
                 // Other operation on RAX, this may not actually modify RAX but its unexpected
                 // so lets reset the counter
@@ -203,14 +217,60 @@ fn unhook_iat_entry(iat_entry: &ImportAddressEntry) -> Result<bool, PEHelperErro
             instr_since_rax = 0;
             rax_indirect_load = None;
         }
+
         if instr_since_rax > 0 {
             instr_since_rax += 1;
         }
         // Check if the instruction is an indirect call
         if instruction.is_call_far_indirect() || instruction.is_call_near_indirect() {
             println!("Found indirect far call");
-            return match rax_indirect_load {
-                Some(rax_indirect_load) => {
+            match rax_indirect_load {
+                Some(rax_indirect_load_in) => {
+                    let displacement = rax_indirect_load_in;
+                    // Further validate the load contains a valid address, this can either be
+                    // a syscall stub (starting with mov r10, rcx) this is the bytes 0x4c8bd1,
+                    // or it can be an address within ntdll itself (as ntdll has functions
+                    // that don't always result in instant syscalling)
+                    let syscall_stub_start: [u8; 3] = [0x4c, 0x8b, 0xd1];
+                    let syscall_stub_bytes =
+                        unsafe { std::slice::from_raw_parts(displacement as *const u8, 3) };
+                    let is_syscall_stub = syscall_stub_bytes == syscall_stub_start;
+                    // Now check if it falls within the address range of ntdll (we check for 1-level
+                    // jmp, e.g. if the target contains an unconditional jmp to within ntdll)
+                    let is_in_ntdll = {
+                        if !is_syscall_stub {
+                            // We treat the displacement as a pointer to the location to execute,
+                            // we need to extract the containing 64-bit address
+                            let target_ptr = unsafe { &*(displacement as *const u64) };
+                            println!("Checking if {:#x} contains a jmp within ntdll", *target_ptr);
+                            contains_ntdll_jmp(*target_ptr, ntdll_start, ntdll_end)
+                        } else {
+                            // Doesn't matter what we return here, we've determined the location
+                            // is a syscall stub regardless
+                            false
+                        }
+                    };
+
+                    if !is_syscall_stub && !is_in_ntdll {
+                        println!(
+                            "Not syscall stub or within ntdll at address {:#x}",
+                            displacement
+                        );
+                        rax_indirect_load = None;
+                        instr_since_rax = 0;
+                        continue;
+                    } else {
+                        println!(
+                            "Found syscall stub or ntdll function at address {:#x}, for ip: {:#x}",
+                            displacement,
+                            instruction.ip()
+                        );
+                    }
+
+                    println!(
+                        "replace_addrp: {:#x}, rax_indirect_load_ptr: {:#x}",
+                        replace_addr, rax_indirect_load_in
+                    );
                     // We have a potential match
                     // Patch the IAT
                     // First, call virtual_protect to make the page writable
@@ -224,7 +284,7 @@ fn unhook_iat_entry(iat_entry: &ImportAddressEntry) -> Result<bool, PEHelperErro
                     // Now we can patch the iat entry
                     let iat_entry_ptr = replace_addr as *mut u64;
                     // Get the actual target address
-                    let rax_indirect_load = unsafe { *(rax_indirect_load as *const u64) };
+                    let rax_indirect_load = unsafe { *(rax_indirect_load_in as *const u64) };
                     unsafe { *iat_entry_ptr = rax_indirect_load };
                     // Now we can call virtual_protect to restore the old protection
                     let result = unsafe {
@@ -234,19 +294,66 @@ fn unhook_iat_entry(iat_entry: &ImportAddressEntry) -> Result<bool, PEHelperErro
                         return Err(PEHelperError::VirtualProtectFailed);
                     }
                     // Done, return
-                    Ok(true)
+                    return Ok(true);
                 }
                 None => {
-                    println!("Found indirect call, but RAX was not loaded with a global pointer");
-                    // Not expecting any other indirect calls, so we assume the target is not hooked
-                    Ok(false)
+                    // Not expecting any other indirect calls, simply continue to the next instruction
+                    continue;
                 }
             };
+        }
+        // Check if instruction is a return
+        if instruction.flow_control() == FlowControl::Return || instruction.is_invalid() {
+            // Assume target isn't hooked as we didn't find the syscall stub
+            println!("Invalid instruction or return");
+            return Ok(false);
         }
         instruction = Instruction::default();
     }
     // If we reached here, we didn't find the hook
     Ok(false)
+}
+
+fn contains_ntdll_jmp(displacement: u64, ntdll_start: u64, ntdll_end: u64) -> bool {
+    // Check if the displacement is within the ntdll range, in which case we simply return true
+    if displacement >= ntdll_start && displacement < ntdll_end {
+        return true;
+    }
+    let mut instrs = 0;
+    // Now check if the displacement contains a jmp to within ntdll
+    let mut instruction = Instruction::default();
+    let bytes = unsafe { std::slice::from_raw_parts(displacement as *const u8, 0x512) };
+    let mut decoder = Decoder::with_ip(64, bytes, displacement, DecoderOptions::NO_INVALID_CHECK);
+    while decoder.can_decode() {
+        instrs += 1;
+        // Check if we've exceeded our instr count, we don't expect the jmp to be more than
+        // 30 instrs away
+        if instrs > 30 {
+            return false;
+        }
+        decoder.decode_out(&mut instruction);
+        // Check if instr is an unconditional jmp
+        if instruction.is_jmp_far_indirect() || instruction.is_jmp_near_indirect() {
+            // Ensure its a jmp on memory
+            if instruction.op_kind(0) == OpKind::Memory {
+                // Check if the jmp target is within ntdll
+                let jmp_target = instruction.memory_displacement64();
+                if jmp_target >= ntdll_start && jmp_target < ntdll_end {
+                    return true;
+                }
+                // Expect jmp_target to be a pointer to a u64 we must deref in this case
+                if jmp_target < 0x10000 || jmp_target > 0x7FFF_FFFF_FFFF_FFFF {
+                    continue;
+                }
+                let jmp_target_ptr = unsafe { &*(jmp_target as *const u64) };
+                if *jmp_target_ptr >= ntdll_start && *jmp_target_ptr < ntdll_end {
+                    return true;
+                }
+            }
+        }
+    }
+    // Didn't find a jmp to within ntdll
+    return false;
 }
 
 /// Custom GetProcAddress implementation by parsing the export directory table of a PE64 module
