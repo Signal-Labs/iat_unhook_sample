@@ -3,11 +3,13 @@
 A library and binary (both built via cargo build) for testing unhooking ntdll by identifying hooks via in-memory disassembly,
 identifying the original/relocated syscall block for the hooked function and fixing up the IAT pointer appropriately.
 
-Only works for IAT functions (won't unhook runtime discovered functions e.g. via GetProcAddress).
+Only works for IAT functions (won't unhook runtime discovered functions e.g. via GetProcAddress), note that this doesn't mean we are limited to fixing patched/modified IAT entries, most tested EDRs/AVs don't patch the IAT directly but the actual start of the function in ntdll itself that the IAT points to. We change the IAT pointer to point to the proper (relocated by the AV/EDR) syscall stub.
 
 Tested against Sophos free AV.
 
 Only for a sample of unhooking using a technique other than loading a second ntdll or using direct/inline syscalls.
+
+This sample also uses "GetModuleHandleA" for getting the base address of the current process, but there's internal functions (e.g. get_module_by_name) that can replace it to further reduce Windows API usage.
 
 This repository consists of the following:
 
@@ -19,3 +21,12 @@ This repository consists of the following:
     - Various helper functions for parsing in-memory PE32+ files 
 - src\pe_defs.rs
     - Additional types for PE32+ file parsing
+    
+    
+# Hooked vs Unhooked Comparison
+
+Hooked:
+![hooked_iat](https://user-images.githubusercontent.com/16039802/226813526-63c0278d-a6d8-4004-aed6-dc9cadf05d0d.png)
+
+Unhooked:
+![unhooked_iat](https://user-images.githubusercontent.com/16039802/226813548-d9b83110-64e4-42b9-8d5d-edd9205ff7f9.png)
