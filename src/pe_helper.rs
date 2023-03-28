@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use crate::pe_def;
 use crate::pe_helper::pe_def::{
     ASCIIString, ImageDataDirectory, ImageDataDirectoryEntry, ImageDataDirectoryInfo,
     ImageDataDirectoryVec, ImportAddressEntry, PEType, Pe64C, UnicodeString, PE64, RVA32,
@@ -7,16 +8,14 @@ use crate::pe_helper::pe_def::{
 use alloc::sync::Arc;
 use core::arch::asm;
 use core::mem::transmute;
+use iced_x86::code_asm::*;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind, Register};
 use std::sync::Mutex;
-use windows::core::PCSTR;
-use windows::Win32::System::LibraryLoader::GetModuleHandleA;
-use windows::Win32::System::Memory::{VirtualProtect, PAGE_PROTECTION_FLAGS, PAGE_READWRITE};
-
-use crate::pe_def;
+use windows::Win32::Foundation::{GetLastError, HANDLE};
+use windows::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS};
 
 /// Error type for the PE helper
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PEHelperError {
     LockFailure,
     ModuleNotFound,
@@ -34,10 +33,35 @@ pub enum PEHelperError {
     InvalidPeSignature,
     UnhandledPeType,
     InvalidNumberOfDataDirectoryEntries,
+    InvalidArgument,
+    CodeAssemblerError(String),
+    ExportNotFound,
+    ExportNamePtrEntryNotFound,
+    ExportOrdinalEntryNotFound,
 }
 
 // Global mutable vec of ModuleHandles using Mutex and Arc
 static MODULES: Mutex<Vec<Arc<ModuleHandle64>>> = Mutex::new(Vec::new());
+static VPROTECT: Mutex<Option<extern "system" fn(isize, *mut u64, usize, u64, *mut u32) -> i64>> =
+    Mutex::new(None);
+
+/// Attempts to unhook a single address, if hooked
+pub fn unpatch_single(
+    target: usize,
+    ntdll_start: u64,
+    ntdll_end: u64,
+    addr_list: &Vec<usize>,
+) -> Result<bool, PEHelperError> {
+    let inner = unhook_iat_entry(
+        None,
+        Some(target as u64),
+        ntdll_start,
+        ntdll_end,
+        None,
+        addr_list,
+    )?;
+    return Ok(inner);
+}
 
 /// Attempts to unhook the IAT of the current process, returns Ok(true) if successful,
 /// Ok(false) if no hooks were detected, or Err if an error occurred.
@@ -48,21 +72,14 @@ pub fn unpatch_iat_hooks(hmod: &ModuleHandle64) -> Result<bool, PEHelperError> {
     }
     // We only unhook ntdll, ensure all unhooked entries
     // fall within ntdll
-    let ntdll_str = "ntdll.dll\0";
-    let ntdll_pcstr = PCSTR::from_raw(ntdll_str.as_ptr());
-    let base_address_ntdll = match unsafe { GetModuleHandleA(ntdll_pcstr) } {
-        Ok(base_address) => base_address,
-        Err(_) => return Err(PEHelperError::ModuleNotFound),
-    };
-    // Get a parsed PE file from the base address of ntdll
-    let pe_file_ntdll = match get_module_by_address(base_address_ntdll.0 as usize) {
-        Some(pe_file) => pe_file,
+    let ntdll = match get_module_by_name("ntdll.dll") {
+        Some(ntdll) => ntdll,
         None => return Err(PEHelperError::ModuleNotFound),
     };
-    // Get the start and end of ntdll which we use to check if the target of the iat entry is
-    // within ntdll
-    let ntdll_start = pe_file_ntdll.get_base_address();
-    let ntdll_end = ntdll_start + pe_file_ntdll.get_size();
+    let ntdll_start = ntdll.get_base_address() as u64;
+    let ntdll_end = ntdll_start + ntdll.get_size() as u64;
+    let addr_listr = get_export_table(&ntdll).expect("Failed to get export table");
+    let addr_list = &addr_listr;
 
     // Get exclusive access to the pe file
     let pe_lock = hmod.pe.lock().map_err(|_| PEHelperError::LockFailure)?;
@@ -82,7 +99,7 @@ pub fn unpatch_iat_hooks(hmod: &ModuleHandle64) -> Result<bool, PEHelperError> {
     }
     let mut patched = false;
     // Loop through the iat, and check if any of the entries are hooked
-    println!("Looping through iat addresses");
+    //println!("Looping through iat addresses");
     for iat_entry in iat.addresses.iter() {
         // Ensure the target is within ntdll, otherwise its another module or potentially uninitialized
         if iat_entry.target_function_address < (ntdll_start as u64)
@@ -90,11 +107,18 @@ pub fn unpatch_iat_hooks(hmod: &ModuleHandle64) -> Result<bool, PEHelperError> {
         {
             continue;
         }
-        println!(
+        /*println!(
             "IAT address :{:#x}, target: {:#x}",
             iat_entry.iat_entry_address, iat_entry.target_function_address
-        );
-        let result = unhook_iat_entry(iat_entry, ntdll_start as u64, ntdll_end as u64)?;
+        );*/
+        let result = unhook_iat_entry(
+            None,
+            Some(ntdll_start as u64),
+            ntdll_start as u64,
+            ntdll_end as u64,
+            None,
+            addr_list,
+        )?;
         if result {
             println!(
                 "Unhooked iat entry at {:x}, orig_target:{:#x}",
@@ -106,26 +130,85 @@ pub fn unpatch_iat_hooks(hmod: &ModuleHandle64) -> Result<bool, PEHelperError> {
     Ok(patched)
 }
 
+/// Attempts to get the unhooked start address of VirtualProtect
+fn get_vprotect_addr(
+    addr_list: &Vec<usize>,
+) -> extern "system" fn(isize, *mut u64, usize, u64, *mut u32) -> i64 {
+    // Get the address of ntdll
+    let ntdll = get_module_by_name("ntdll.dll").unwrap();
+    let target_str = "ZwProtectVirtualMemory";
+    let target_addr = ntdll.get_export_addr_from_name(target_str).unwrap();
+    let mut target_addr_ptr: usize = 0;
+    let res = unhook_iat_entry(
+        None,
+        Some(target_addr as u64),
+        ntdll.get_base_address() as u64,
+        (ntdll.get_base_address() + ntdll.get_size()) as u64,
+        Some(&mut target_addr_ptr),
+        &addr_list,
+    )
+    .unwrap();
+    assert!(res);
+    // Transmute target_addr_ptr and return
+    let vprotect: extern "system" fn(isize, *mut u64, usize, u64, *mut u32) -> i64 =
+        unsafe { transmute(target_addr_ptr) };
+    vprotect
+}
+
 /// Takes an iat_entry, disassembles the target function to determine if its hooked,
 /// if it is, it will unhook it and return Ok(true), if it is not hooked, it will return Ok(false),
 /// if an error occurs, it will return Err.
 fn unhook_iat_entry(
-    iat_entry: &ImportAddressEntry,
+    iat_entry: Option<&ImportAddressEntry>,
+    single_addr: Option<u64>,
     ntdll_start: u64,
     ntdll_end: u64,
+    out_address: Option<&mut usize>,
+    addr_list: &Vec<usize>,
 ) -> Result<bool, PEHelperError> {
-    let target_addr = iat_entry.target_function_address;
-    let replace_addr = iat_entry.iat_entry_address;
+    let is_single = single_addr.is_some();
+    let is_iat = iat_entry.is_some();
+    if is_single == is_iat {
+        return Err(PEHelperError::InvalidArgument);
+    }
+
+    let (target_addr, mut replace_addr) = {
+        if is_single {
+            (single_addr.unwrap(), single_addr.unwrap())
+        } else {
+            (
+                iat_entry.unwrap().target_function_address,
+                iat_entry.unwrap().iat_entry_address,
+            )
+        }
+    };
+    //println!("Target addr: {:#x}, replace addr: {:#x}", target_addr, replace_addr);
     // Ensure the addresses are at least non-zero
     if target_addr == 0 || replace_addr == 0 {
         return Ok(false);
     }
 
+    let virtual_protect = {
+        if out_address.is_some() {
+            None
+        } else {
+            let mut vprotect = VPROTECT.lock().map_err(|_| PEHelperError::LockFailure)?;
+            match vprotect.as_ref() {
+                Some(vprotect) => Some(*vprotect),
+                None => {
+                    let addr = get_vprotect_addr(addr_list);
+                    vprotect.replace(addr);
+                    //println!("Replaced vprotect, new address: {:#x}", addr as usize);
+                    Some(addr)
+                }
+            }
+        }
+    };
+
     // Define the buffer of bytes to disassemble, we will disassemble 512-bytes at a time.
     // This is unsafe as we do little to no bounds checking.
 
-    let target_len = 0x4000;
-
+    let target_len = 0x2000;
     // We loop until we patch the hook or reach the end of our analysis for this target address.
     let target_bytes = unsafe { std::slice::from_raw_parts(target_addr as *const u8, target_len) };
     // Disassemble
@@ -143,10 +226,14 @@ fn unhook_iat_entry(
     if instruction.code().op_code().mnemonic() != iced_x86::Mnemonic::Jmp {
         return Ok(false);
     }
-    println!("Found jmp hook\n");
+    //println!("Found jmp hook");
     // Now change the decoder to decode the target of the jmp
     let target = instruction.near_branch_target();
-    println!("Stage 1 jmp target: {:#x}", target);
+    if target == 0 {
+        // Not the jmp we expected
+        return Ok(false);
+    }
+    //println!("Stage 1 jmp target: {:#x}", target);
     let target_bytes = unsafe { std::slice::from_raw_parts(target as *const u8, target_len) };
     decoder = Decoder::with_ip(64, target_bytes, target, DecoderOptions::NO_INVALID_CHECK);
 
@@ -159,7 +246,7 @@ fn unhook_iat_entry(
         // We expect this to be a jmp[mem], so we get the memory location, deref it and start a new decoder
         // at the new target
         let target_ptr = unsafe { &*(instruction.memory_displacement64() as *const u64) };
-        println!("Stage 2 jmp target: {:#x}", *target_ptr);
+        //println!("Stage 2 jmp target: {:#x}", *target_ptr);
         let target_bytes =
             unsafe { std::slice::from_raw_parts(*target_ptr as *const u8, target_len) };
         decoder = Decoder::with_ip(
@@ -185,17 +272,17 @@ fn unhook_iat_entry(
         if instruction.code().op_code().mnemonic() == iced_x86::Mnemonic::Syscall
             || instruction.code().op_code().mnemonic() == iced_x86::Mnemonic::Ret
         {
-            println!("Found syscall or ret\n");
+            //println!("Found syscall or ret\n");
             return Ok(false);
         }
 
         if instruction.op_kind(0) == OpKind::Register && instruction.op_register(0) == Register::RAX
         {
             if instruction.op_kind(1) == OpKind::Memory {
-                println!(
+                /*println!(
                     "Found RAX indirect load at instruction addr: {:#x}",
                     instruction.ip()
-                );
+                );*/
                 let displacement = instruction.memory_displacement64();
                 if displacement < 0x10000 || displacement > 0x7FFF_FFFF_FFFF_FFFF {
                     // This is not a valid address, ignore it
@@ -223,7 +310,7 @@ fn unhook_iat_entry(
         }
         // Check if the instruction is an indirect call
         if instruction.is_call_far_indirect() || instruction.is_call_near_indirect() {
-            println!("Found indirect far call");
+            //println!("Found indirect far call");
             match rax_indirect_load {
                 Some(rax_indirect_load_in) => {
                     let displacement = rax_indirect_load_in;
@@ -242,8 +329,14 @@ fn unhook_iat_entry(
                             // We treat the displacement as a pointer to the location to execute,
                             // we need to extract the containing 64-bit address
                             let target_ptr = unsafe { &*(displacement as *const u64) };
-                            println!("Checking if {:#x} contains a jmp within ntdll", *target_ptr);
-                            contains_ntdll_jmp(*target_ptr, ntdll_start, ntdll_end)
+                            if replace_addr == 0x7ff82cd78e10 {
+                                println!(
+                                    "Pss target_ptr = {:#x}, raw displacement: {:#x}",
+                                    *target_ptr, displacement
+                                );
+                            }
+                            //println!("Checking if {:#x} contains a jmp within ntdll", *target_ptr);
+                            contains_ntdll_jmp(*target_ptr, ntdll_start, ntdll_end, addr_list)
                         } else {
                             // Doesn't matter what we return here, we've determined the location
                             // is a syscall stub regardless
@@ -252,47 +345,247 @@ fn unhook_iat_entry(
                     };
 
                     if !is_syscall_stub && !is_in_ntdll {
-                        println!(
+                        /*println!(
                             "Not syscall stub or within ntdll at address {:#x}",
                             displacement
-                        );
+                        );*/
                         rax_indirect_load = None;
                         instr_since_rax = 0;
                         continue;
                     } else {
-                        println!(
+                        /*println!(
                             "Found syscall stub or ntdll function at address {:#x}, for ip: {:#x}",
                             displacement,
                             instruction.ip()
+                        );*/
+                    }
+
+                    /*println!(
+                        "replace_addrp: {:#x}, rax_indirect_load_ptr: {:#x}",
+                        replace_addr, rax_indirect_load_in
+                    );*/
+                    // We have a potential match
+                    // Patch the IAT
+                    //println!("Getting vprotect address");
+
+                    let virtual_protect = match out_address {
+                        Some(out_address) => {
+                            *out_address = unsafe { *(rax_indirect_load_in as *const usize) };
+                            return Ok(true);
+                        }
+                        None => virtual_protect.unwrap(),
+                    };
+                    //println!("Got it!, addr: {:#x}", virtual_protect as usize);
+                    // First, call virtual_protect to make the page writable
+                    let mut old_protect = PAGE_PROTECTION_FLAGS(0);
+                    let sz: u64 = 8;
+                    //println!("Calling vprotect to mark rwx");
+                    let replace_addr_orig = replace_addr;
+
+                    let result = {
+                        let res = virtual_protect(
+                            HANDLE(-1).0,
+                            &mut replace_addr as *mut u64,
+                            &sz as *const _ as usize,
+                            PAGE_EXECUTE_READWRITE.0 as u64,
+                            &mut old_protect.0,
+                        );
+                        let res = {
+                            if res == 0xc0000045 {
+                                let res_tmp = virtual_protect(
+                                    HANDLE(-1).0,
+                                    &mut replace_addr as *mut u64,
+                                    &sz as *const _ as usize,
+                                    PAGE_EXECUTE_READWRITE.0 as u64,
+                                    &mut old_protect.0,
+                                );
+                                if res_tmp >= 0 {
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                if res >= 0 {
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                        };
+                        res
+                    };
+                    replace_addr = replace_addr_orig;
+                    if !result {
+                        println!("Error calling virtual protect: {:#x}", unsafe {
+                            GetLastError().0
+                        });
+                        return Err(PEHelperError::VirtualProtectFailed);
+                    }
+
+                    // Get the actual target address
+                    let rax_indirect_load = unsafe { *(rax_indirect_load_in as *const u64) };
+
+                    if replace_addr == 0x7ff82cd78e10 {
+                        println!(
+                            "Found Pss, is_syscall_stub: {}, is_in_ntdll: {}, with addr:{:#x}",
+                            is_syscall_stub, is_in_ntdll, rax_indirect_load
                         );
                     }
 
-                    println!(
-                        "replace_addrp: {:#x}, rax_indirect_load_ptr: {:#x}",
-                        replace_addr, rax_indirect_load_in
-                    );
-                    // We have a potential match
-                    // Patch the IAT
-                    // First, call virtual_protect to make the page writable
-                    let mut old_protect = PAGE_PROTECTION_FLAGS(0);
-                    let result = unsafe {
-                        VirtualProtect(replace_addr as *mut _, 8, PAGE_READWRITE, &mut old_protect)
-                    };
-                    if !result.as_bool() {
-                        return Err(PEHelperError::VirtualProtectFailed);
-                    }
                     // Now we can patch the iat entry
-                    let iat_entry_ptr = replace_addr as *mut u64;
-                    // Get the actual target address
-                    let rax_indirect_load = unsafe { *(rax_indirect_load_in as *const u64) };
-                    unsafe { *iat_entry_ptr = rax_indirect_load };
+                    let replace_ptr = replace_addr as *mut u64;
+                    if is_iat {
+                        unsafe { *replace_ptr = rax_indirect_load };
+                    } else {
+                        // Assemble a JMP <rax_indirect_load> instruction
+                        let mut jmp_instruction = match CodeAssembler::new(64)
+                            .map_err(|e| PEHelperError::CodeAssemblerError(format!("{:?}", e)))
+                        {
+                            Ok(jmp_instruction) => jmp_instruction,
+                            Err(e) => {
+                                let result = {
+                                    let res = virtual_protect(
+                                        HANDLE(-1).0,
+                                        &mut replace_addr as *mut u64,
+                                        &sz as *const _ as usize,
+                                        old_protect.0 as u64,
+                                        &mut old_protect.0,
+                                    );
+                                    let res = {
+                                        if res == 0xc0000045 {
+                                            let res_tmp = virtual_protect(
+                                                HANDLE(-1).0,
+                                                &mut replace_addr as *mut u64,
+                                                &sz as *const _ as usize,
+                                                old_protect.0 as u64,
+                                                &mut old_protect.0,
+                                            );
+                                            if res_tmp >= 0 {
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        } else {
+                                            if res >= 0 {
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                    };
+                                    res
+                                };
+                                replace_addr = replace_addr_orig;
+                                if !result {
+                                    println!("Error calling virtual protect: {:#x}", unsafe {
+                                        GetLastError().0
+                                    });
+                                    return Err(PEHelperError::VirtualProtectFailed);
+                                }
+                                return Err(e);
+                            }
+                        };
+                        match jmp_instruction
+                            .jmp(rax_indirect_load)
+                            .map_err(|e| PEHelperError::CodeAssemblerError(format!("{:?}", e)))
+                        {
+                            Ok(_) => (),
+                            Err(e) => {
+                                let result = {
+                                    let res = virtual_protect(
+                                        HANDLE(-1).0,
+                                        &mut replace_addr as *mut u64,
+                                        &sz as *const _ as usize,
+                                        old_protect.0 as u64,
+                                        &mut old_protect.0,
+                                    );
+                                    let res = {
+                                        if res == 0xc0000045 {
+                                            let res_tmp = virtual_protect(
+                                                HANDLE(-1).0,
+                                                &mut replace_addr as *mut u64,
+                                                &sz as *const _ as usize,
+                                                old_protect.0 as u64,
+                                                &mut old_protect.0,
+                                            );
+                                            if res_tmp >= 0 {
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        } else {
+                                            if res >= 0 {
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                    };
+                                    res
+                                };
+                                replace_addr = replace_addr_orig;
+                                if !result {
+                                    println!("Error calling virtual protect: {:#x}", unsafe {
+                                        GetLastError().0
+                                    });
+                                    return Err(PEHelperError::VirtualProtectFailed);
+                                }
+                                return Err(e);
+                            }
+                        };
+                        let bytes = jmp_instruction
+                            .assemble(replace_addr)
+                            .map_err(|e| PEHelperError::CodeAssemblerError(format!("{:?}", e)))?;
+                        unsafe {
+                            println!("Overwriting addr:{:#x}", replace_addr);
+                            core::intrinsics::volatile_copy_nonoverlapping_memory(
+                                replace_ptr as *mut u8,
+                                bytes.as_ptr(),
+                                bytes.len(),
+                            );
+                        }
+                    }
                     // Now we can call virtual_protect to restore the old protection
-                    let result = unsafe {
-                        VirtualProtect(replace_addr as *mut _, 8, old_protect, &mut old_protect)
+                    let result = {
+                        let res = virtual_protect(
+                            HANDLE(-1).0,
+                            &mut replace_addr as *mut u64,
+                            &sz as *const _ as usize,
+                            old_protect.0 as u64,
+                            &mut old_protect.0,
+                        );
+                        let res = {
+                            if res == 0xc0000045 {
+                                let res_tmp = virtual_protect(
+                                    HANDLE(-1).0,
+                                    &mut replace_addr as *mut u64,
+                                    &sz as *const _ as usize,
+                                    old_protect.0 as u64,
+                                    &mut old_protect.0,
+                                );
+                                if res_tmp >= 0 {
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                if res >= 0 {
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                        };
+                        res
                     };
-                    if !result.as_bool() {
+                    replace_addr = replace_addr_orig;
+                    if !result {
+                        println!("Error calling virtual protect: {:#x}", unsafe {
+                            GetLastError().0
+                        });
                         return Err(PEHelperError::VirtualProtectFailed);
                     }
+                    //println!("Done");
                     // Done, return
                     return Ok(true);
                 }
@@ -305,7 +598,7 @@ fn unhook_iat_entry(
         // Check if instruction is a return
         if instruction.flow_control() == FlowControl::Return || instruction.is_invalid() {
             // Assume target isn't hooked as we didn't find the syscall stub
-            println!("Invalid instruction or return");
+            //println!("Invalid instruction or return");
             return Ok(false);
         }
         instruction = Instruction::default();
@@ -314,9 +607,21 @@ fn unhook_iat_entry(
     Ok(false)
 }
 
-fn contains_ntdll_jmp(displacement: u64, ntdll_start: u64, ntdll_end: u64) -> bool {
+fn contains_ntdll_jmp(
+    displacement: u64,
+    ntdll_start: u64,
+    ntdll_end: u64,
+    addr_list: &Vec<usize>,
+) -> bool {
     // Check if the displacement is within the ntdll range, in which case we simply return true
     if displacement >= ntdll_start && displacement < ntdll_end {
+        // Ensure displacement is not the start of a function, if so its not the hooked jmp
+        // we expect and is likely a regular function call.
+        for addr in addr_list {
+            if *addr as u64 == displacement {
+                return false;
+            }
+        }
         return true;
     }
     let mut instrs = 0;
@@ -332,6 +637,15 @@ fn contains_ntdll_jmp(displacement: u64, ntdll_start: u64, ntdll_end: u64) -> bo
             return false;
         }
         decoder.decode_out(&mut instruction);
+
+        // Check if the instruction is a syscall or a ret, in which case we assume its not hooked
+        if instruction.code().op_code().mnemonic() == iced_x86::Mnemonic::Syscall
+            || instruction.code().op_code().mnemonic() == iced_x86::Mnemonic::Ret
+        {
+            //println!("Found syscall or ret\n");
+            return false;
+        }
+
         // Check if instr is an unconditional jmp
         if instruction.is_jmp_far_indirect() || instruction.is_jmp_near_indirect() {
             // Ensure its a jmp on memory
@@ -339,6 +653,13 @@ fn contains_ntdll_jmp(displacement: u64, ntdll_start: u64, ntdll_end: u64) -> bo
                 // Check if the jmp target is within ntdll
                 let jmp_target = instruction.memory_displacement64();
                 if jmp_target >= ntdll_start && jmp_target < ntdll_end {
+                    // Ensure displacement is not the start of a function, if so its not the hooked jmp
+                    // we expect and is likely a regular function call.
+                    for addr in addr_list {
+                        if *addr as u64 == displacement {
+                            continue;
+                        }
+                    }
                     return true;
                 }
                 // Expect jmp_target to be a pointer to a u64 we must deref in this case
@@ -347,6 +668,13 @@ fn contains_ntdll_jmp(displacement: u64, ntdll_start: u64, ntdll_end: u64) -> bo
                 }
                 let jmp_target_ptr = unsafe { &*(jmp_target as *const u64) };
                 if *jmp_target_ptr >= ntdll_start && *jmp_target_ptr < ntdll_end {
+                    // Ensure displacement is not the start of a function, if so its not the hooked jmp
+                    // we expect and is likely a regular function call.
+                    for addr in addr_list {
+                        if *addr as u64 == displacement {
+                            continue;
+                        }
+                    }
                     return true;
                 }
             }
@@ -354,6 +682,38 @@ fn contains_ntdll_jmp(displacement: u64, ntdll_start: u64, ntdll_end: u64) -> bo
     }
     // Didn't find a jmp to within ntdll
     return false;
+}
+
+/// Returns an array of function pointers for a module's export table
+pub fn get_export_table(hmod: &ModuleHandle64) -> Result<Vec<usize>, PEHelperError> {
+    if !hmod.is_pe_parsed()? {
+        // Parse the pe if its not already parsed
+        hmod.parse_pe()?;
+    }
+    // At this point we guarantee the pe in the module handle is parsed
+    let pe_lock = hmod.pe.lock().map_err(|_| PEHelperError::LockFailure)?;
+    let pe = match pe_lock.as_ref() {
+        Some(pe) => pe,
+        None => return Err(PEHelperError::PEFileNotParsed),
+    };
+    let base_addr = hmod.get_base_address();
+    // Get the export table so we can get the address of the export name pointer table and find
+    // the index of the target function name
+    let export_directory_table = match pe.get_data_directories().get_export_table() {
+        Some(export_directory_table) => export_directory_table,
+        None => return Err(PEHelperError::ExportDirectoryTableNotFound),
+    };
+    let mut export_addrs = Vec::new();
+    for idx in 0..export_directory_table.number_of_functions {
+        let export_entry = export_directory_table
+            .get_export_address_table_entry(idx, base_addr)
+            .ok_or(PEHelperError::ExportDirectoryTableNotFound)?;
+        let addr = export_entry.0.get(base_addr);
+        // transmute addr to a usize
+        let addr: usize = unsafe { transmute(addr) };
+        export_addrs.push(addr);
+    }
+    return Ok(export_addrs);
 }
 
 /// Custom GetProcAddress implementation by parsing the export directory table of a PE64 module
@@ -390,7 +750,7 @@ pub fn get_proc_address(
         None => return Err(PEHelperError::ExportOrdinalNotFound),
     };
     let export_addr = match export_directory_table
-        .get_export_address_table_entry(*export_addr_index, pe.base_address)
+        .get_export_address_table_entry(export_addr_index.0 as u32, pe.base_address)
     {
         Some(export_addr) => export_addr,
         None => return Err(PEHelperError::ExportAddressNotFound),
@@ -518,9 +878,9 @@ pub fn get_module_by_address(target_module_address: usize) -> Option<Arc<ModuleH
 fn get_peb() -> Option<PEB> {
     // Check if GS register is null
     unsafe {
-        let gs: usize;
-        asm!("mov {}, gs", out(reg) gs, options(nomem, nostack));
-        if gs == 0 {
+        let r_gs: usize;
+        asm!("mov {}, gs", out(reg) r_gs, options(nomem, nostack));
+        if r_gs == 0 {
             return None;
         }
     }
@@ -548,6 +908,10 @@ impl ModuleHandle64 {
     pub fn get_name(&self) -> &str {
         &self.name
     }
+    /// Gets the internal PE
+    pub fn get_pe(&self) -> &Mutex<Option<Box<PE64>>> {
+        return &self.pe;
+    }
     /// Returns the base field of the module.
     pub fn get_base_address(&self) -> usize {
         self.base
@@ -555,6 +919,33 @@ impl ModuleHandle64 {
     /// Returns the size field of the module
     pub fn get_size(&self) -> usize {
         self.size
+    }
+    pub fn get_export_addr_from_name(&self, target_str: &str) -> Result<usize, PEHelperError> {
+        let mut pe_self = self.pe.lock().map_err(|_| PEHelperError::LockFailure)?;
+        let pe = match pe_self.as_mut() {
+            Some(pe) => pe,
+            None => return Err(PEHelperError::PEFileNotParsed),
+        };
+        let export_table = match pe.get_data_directories().get_export_table() {
+            Some(export_table) => export_table,
+            None => return Err(PEHelperError::ExportDirectoryTableNotFound),
+        };
+        let target_ord = match export_table.get_export_name_ptr_table_entry(target_str, self.base) {
+            Some(target_ord) => target_ord,
+            None => return Err(PEHelperError::ExportNamePtrEntryNotFound),
+        };
+        let target_entry = match export_table.get_export_ordinal_table_entry(target_ord, self.base)
+        {
+            Some(target_entry) => target_entry,
+            None => return Err(PEHelperError::ExportOrdinalEntryNotFound),
+        };
+        let target_addr =
+            match export_table.get_export_address_table_entry(target_entry.0 as u32, self.base) {
+                Some(target_addr) => target_addr,
+                None => return Err(PEHelperError::ExportAddressNotFound),
+            };
+        let target_raw_addr = target_addr.0.get(self.base) as *const _ as usize;
+        return Ok(target_raw_addr);
     }
     /// Parses the pe file represented by this module, stores the result
     /// in the associated pe variable and returns a result
@@ -691,7 +1082,7 @@ mod tests {
             .get_export_ordinal_table_entry(ordinal_table_index, pe.base_address)
             .unwrap();
         let export_addr = export_directory_table
-            .get_export_address_table_entry(*export_addr_index, pe.base_address)
+            .get_export_address_table_entry(export_addr_index.0 as u32, pe.base_address)
             .unwrap();
         let export_absolute = export_addr.0.get(pe.base_address) as *const _ as usize;
         let is_within_mod_range = {

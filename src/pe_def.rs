@@ -355,10 +355,10 @@ impl ExportDirectoryTable {
     // index is within bounds based on the number_of_functions field
     pub fn get_export_address_table_entry(
         &self,
-        index: ExportAddressTableIndex,
+        index: u32,
         base_address: usize,
     ) -> Option<&ExportAddressTableEntry> {
-        let index = index.0 as usize;
+        let index = index as usize;
         if index >= self.number_of_functions as usize {
             return None;
         }
@@ -407,7 +407,7 @@ impl ExportDirectoryTable {
 
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub struct ExportAddressTableIndex(u16);
+pub struct ExportAddressTableIndex(pub u16);
 
 #[derive(Clone, Copy)]
 #[repr(C)]
