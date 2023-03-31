@@ -112,8 +112,8 @@ pub fn unpatch_iat_hooks(hmod: &ModuleHandle64) -> Result<bool, PEHelperError> {
             iat_entry.iat_entry_address, iat_entry.target_function_address
         );*/
         let result = unhook_iat_entry(
+            Some(iat_entry),
             None,
-            Some(ntdll_start as u64),
             ntdll_start as u64,
             ntdll_end as u64,
             None,

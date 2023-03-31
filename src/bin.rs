@@ -1,5 +1,5 @@
 use core::arch::asm;
-use iat_unhook_lib::unhook_iat;
+use iat_unhook_lib::{unhook_exports, unhook_iat};
 
 // import NtWriteVirtualMemory from NTDLL
 #[link(name = "ntdll")]
@@ -43,7 +43,8 @@ fn main() {
         };
     }
 
-    println!("Unhooked IAT: {}", unhook_iat());
+    //println!("Unhooked IAT: {}", unhook_iat());
+    println!("Unhooked NTDLL Exports: {}", unhook_exports());
 
     // Below should be unhooked now
     {
