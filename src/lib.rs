@@ -6,7 +6,9 @@ pub mod pe_helper;
 use crate::pe_helper::{unpatch_iat_hooks, unpatch_single};
 use windows::Win32::System::LibraryLoader::GetModuleHandleA;
 
-/// Unhooks via disassembling each exported function and patching any identified jmps
+/// Unhooks via disassembling each exported function and patching any identified jmps directly
+/// at the function's start, this enables unhooking of functions regardless if they're in our
+/// current IAT and works for functions that are called dynamically via GetProcAddress.
 pub fn unhook_exports() -> bool {
     // Get a handle to the module ntdll using pehelper
     let ntdll = match pe_helper::get_module_by_name("ntdll.dll") {

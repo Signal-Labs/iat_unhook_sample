@@ -139,7 +139,7 @@ fn get_vprotect_addr(
     let target_str = "ZwProtectVirtualMemory";
     let target_addr = ntdll.get_export_addr_from_name(target_str).unwrap();
     let mut target_addr_ptr: usize = 0;
-    let res = unhook_iat_entry(
+    let _res = unhook_iat_entry(
         None,
         Some(target_addr as u64),
         ntdll.get_base_address() as u64,
@@ -148,7 +148,7 @@ fn get_vprotect_addr(
         &addr_list,
     )
     .unwrap();
-    assert!(res);
+
     // Transmute target_addr_ptr and return
     let vprotect: extern "system" fn(isize, *mut u64, usize, u64, *mut u32) -> i64 =
         unsafe { transmute(target_addr_ptr) };
