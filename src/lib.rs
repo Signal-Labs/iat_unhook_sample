@@ -1,5 +1,7 @@
 #![feature(core_intrinsics)]
 
+extern crate core;
+
 mod pe_def;
 pub mod pe_helper;
 

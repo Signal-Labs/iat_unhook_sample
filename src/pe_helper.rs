@@ -208,13 +208,24 @@ fn unhook_iat_entry(
     // Define the buffer of bytes to disassemble, we will disassemble 512-bytes at a time.
     // This is unsafe as we do little to no bounds checking.
 
-    let target_len = 0x2000;
+    let target_len = 2000;
+    let jmp_len = 8*4;
     // We loop until we patch the hook or reach the end of our analysis for this target address.
-    let target_bytes = unsafe { std::slice::from_raw_parts(target_addr as *const u8, target_len) };
+
+    let target_bytes = {
+        let mut bytes = Vec::new();
+        for i in 0..target_len {
+            let byte = unsafe {
+                std::ptr::read_unaligned((target_addr + i) as *const u8)
+            };
+            bytes.push(byte);
+        }
+        bytes
+    };
     // Disassemble
     let mut decoder = Decoder::with_ip(
         64,
-        target_bytes,
+        &target_bytes,
         target_addr,
         DecoderOptions::NO_INVALID_CHECK,
     );
@@ -234,25 +245,45 @@ fn unhook_iat_entry(
         return Ok(false);
     }
     //println!("Stage 1 jmp target: {:#x}", target);
-    let target_bytes = unsafe { std::slice::from_raw_parts(target as *const u8, target_len) };
-    decoder = Decoder::with_ip(64, target_bytes, target, DecoderOptions::NO_INVALID_CHECK);
+    let target_bytes = {
+        let mut bytes = Vec::new();
+        for i in 0..jmp_len {
+            let byte = unsafe {
+                std::ptr::read_unaligned((target + i) as *const u8)
+            };
+            bytes.push(byte);
+        }
+        bytes
+    };
+
+    decoder = Decoder::with_ip(64, &target_bytes, target, DecoderOptions::NO_INVALID_CHECK);
 
     // This should be the second stage jmp
     instruction = Instruction::default();
     // Decode the second instruction
     decoder.decode_out(&mut instruction);
+    let target_bytes ;
     // Support cases where its *not* a jmp, but if it is, we need to follow it
     if instruction.code().op_code().mnemonic() == iced_x86::Mnemonic::Jmp {
         // We expect this to be a jmp[mem], so we get the memory location, deref it and start a new decoder
         // at the new target
         let target_ptr = unsafe { &*(instruction.memory_displacement64() as *const u64) };
         //println!("Stage 2 jmp target: {:#x}", *target_ptr);
-        let target_bytes =
-            unsafe { std::slice::from_raw_parts(*target_ptr as *const u8, target_len) };
+        target_bytes = {
+            let mut bytes = Vec::new();
+            for i in 0..target_len {
+                let byte = unsafe {
+                    std::ptr::read_unaligned((std::ptr::read_unaligned(target_ptr) + i) as *const u8)
+                };
+                bytes.push(byte);
+            }
+            bytes
+        };
+
         decoder = Decoder::with_ip(
             64,
-            target_bytes,
-            *target_ptr,
+            &target_bytes,
+            unsafe {std::ptr::read_unaligned(target_ptr)},
             DecoderOptions::NO_INVALID_CHECK,
         );
     }
@@ -319,8 +350,16 @@ fn unhook_iat_entry(
                     // or it can be an address within ntdll itself (as ntdll has functions
                     // that don't always result in instant syscalling)
                     let syscall_stub_start: [u8; 3] = [0x4c, 0x8b, 0xd1];
-                    let syscall_stub_bytes =
-                        unsafe { std::slice::from_raw_parts(displacement as *const u8, 3) };
+                    let syscall_stub_bytes = {
+                        let mut bytes = Vec::new();
+                        for i in 0..3 {
+                            let byte = unsafe {
+                                std::ptr::read_unaligned((displacement + i) as *const u8)
+                            };
+                            bytes.push(byte);
+                        }
+                        bytes
+                    };
                     let is_syscall_stub = syscall_stub_bytes == syscall_stub_start;
                     // Now check if it falls within the address range of ntdll (we check for 1-level
                     // jmp, e.g. if the target contains an unconditional jmp to within ntdll)
@@ -627,8 +666,17 @@ fn contains_ntdll_jmp(
     let mut instrs = 0;
     // Now check if the displacement contains a jmp to within ntdll
     let mut instruction = Instruction::default();
-    let bytes = unsafe { std::slice::from_raw_parts(displacement as *const u8, 0x512) };
-    let mut decoder = Decoder::with_ip(64, bytes, displacement, DecoderOptions::NO_INVALID_CHECK);
+    let bytes = {
+        let mut bytes = Vec::new();
+        for i in 0..30 {
+            let byte = unsafe {
+                std::ptr::read_unaligned((displacement + i) as *const u8)
+            };
+            bytes.push(byte);
+        }
+        bytes
+    };
+    let mut decoder = Decoder::with_ip(64, &bytes, displacement, DecoderOptions::NO_INVALID_CHECK);
     while decoder.can_decode() {
         instrs += 1;
         // Check if we've exceeded our instr count, we don't expect the jmp to be more than
