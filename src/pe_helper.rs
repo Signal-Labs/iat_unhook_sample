@@ -209,15 +209,13 @@ fn unhook_iat_entry(
     // This is unsafe as we do little to no bounds checking.
 
     let target_len = 2000;
-    let jmp_len = 8*4;
+    let jmp_len = 8 * 4;
     // We loop until we patch the hook or reach the end of our analysis for this target address.
 
     let target_bytes = {
         let mut bytes = Vec::new();
         for i in 0..target_len {
-            let byte = unsafe {
-                std::ptr::read_unaligned((target_addr + i) as *const u8)
-            };
+            let byte = unsafe { std::ptr::read_unaligned((target_addr + i) as *const u8) };
             bytes.push(byte);
         }
         bytes
@@ -248,9 +246,7 @@ fn unhook_iat_entry(
     let target_bytes = {
         let mut bytes = Vec::new();
         for i in 0..jmp_len {
-            let byte = unsafe {
-                std::ptr::read_unaligned((target + i) as *const u8)
-            };
+            let byte = unsafe { std::ptr::read_unaligned((target + i) as *const u8) };
             bytes.push(byte);
         }
         bytes
@@ -262,18 +258,20 @@ fn unhook_iat_entry(
     instruction = Instruction::default();
     // Decode the second instruction
     decoder.decode_out(&mut instruction);
-    let target_bytes ;
+    let target_bytes;
     // Support cases where its *not* a jmp, but if it is, we need to follow it
     if instruction.code().op_code().mnemonic() == iced_x86::Mnemonic::Jmp {
         // We expect this to be a jmp[mem], so we get the memory location, deref it and start a new decoder
         // at the new target
-        let target_ptr = unsafe { &*(instruction.memory_displacement64() as *const u64) };
+        let target_ptr = unsafe { instruction.memory_displacement64() as *const u64 };
         //println!("Stage 2 jmp target: {:#x}", *target_ptr);
         target_bytes = {
             let mut bytes = Vec::new();
             for i in 0..target_len {
                 let byte = unsafe {
-                    std::ptr::read_unaligned((std::ptr::read_unaligned(target_ptr) + i) as *const u8)
+                    std::ptr::read_unaligned(
+                        (std::ptr::read_unaligned(target_ptr) + i) as *const u8,
+                    )
                 };
                 bytes.push(byte);
             }
@@ -283,7 +281,7 @@ fn unhook_iat_entry(
         decoder = Decoder::with_ip(
             64,
             &target_bytes,
-            unsafe {std::ptr::read_unaligned(target_ptr)},
+            unsafe { std::ptr::read_unaligned(target_ptr) },
             DecoderOptions::NO_INVALID_CHECK,
         );
     }
@@ -669,9 +667,7 @@ fn contains_ntdll_jmp(
     let bytes = {
         let mut bytes = Vec::new();
         for i in 0..30 {
-            let byte = unsafe {
-                std::ptr::read_unaligned((displacement + i) as *const u8)
-            };
+            let byte = unsafe { std::ptr::read_unaligned((displacement + i) as *const u8) };
             bytes.push(byte);
         }
         bytes
@@ -714,8 +710,10 @@ fn contains_ntdll_jmp(
                 if jmp_target < 0x10000 || jmp_target > 0x7FFF_FFFF_FFFF_FFFF {
                     continue;
                 }
-                let jmp_target_ptr = unsafe { &*(jmp_target as *const u64) };
-                if *jmp_target_ptr >= ntdll_start && *jmp_target_ptr < ntdll_end {
+                let jmp_target_ptr = unsafe { jmp_target as *const u64 };
+                if unsafe { core::ptr::read_unaligned(jmp_target_ptr) } >= ntdll_start
+                    && unsafe { core::ptr::read_unaligned(jmp_target_ptr) } < ntdll_end
+                {
                     // Ensure displacement is not the start of a function, if so its not the hooked jmp
                     // we expect and is likely a regular function call.
                     for addr in addr_list {
