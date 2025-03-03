@@ -189,9 +189,9 @@ impl ImageDataDirectoryVec {
                 let count = entry.size as usize / core::mem::size_of::<u64>();
                 // Loop through the entries in table and add them to table_r
                 for i in 0..count {
-                    let entry = unsafe { table.addresses.get_unchecked(i) };
+                    let entry = unsafe { &*table.addresses.as_ptr().add(1) };
                     let import_lookup_table_entry =
-                        unsafe { import_lookup_table.entry.get_unchecked(i) };
+                        unsafe { &*import_lookup_table.entry.as_ptr().add(i) };
                     // If the entries are identical, the target has not been bound.
                     // We could handle this, but we just skip it instead.
                     // TODO: handle
@@ -332,7 +332,7 @@ impl ASCIIString {
     pub fn len(&self) -> usize {
         let mut len = 0;
         loop {
-            if unsafe { *self.string.get_unchecked(len) } == 0 {
+            if unsafe { *self.string.as_ptr().add(len) } == 0 {
                 return len;
             }
             len += 1;
@@ -343,7 +343,7 @@ impl ASCIIString {
         let len = self.len();
         let mut string = String::with_capacity(len);
         for i in 0..len {
-            string.push(unsafe { *self.string.get_unchecked(i) } as char);
+            string.push(unsafe { *self.string.as_ptr().add(i) } as char);
         }
         string
     }
@@ -366,7 +366,7 @@ impl ExportDirectoryTable {
         let export_address_table = self.export_address_table_rva.get(base_address);
         // Index into the table, using an unchecked index as the table is defined as a 0-size array
         // and the index is checked above
-        let entry = unsafe { export_address_table.entries.get_unchecked(index) };
+        let entry = unsafe { &*export_address_table.entries.as_ptr().add(index) };
         Some(entry)
     }
     // Gets an entry from the ExportOrdinalTable, similar to how we get entries from the
@@ -381,7 +381,7 @@ impl ExportDirectoryTable {
             return None;
         }
         let export_ordinal_table = self.ordinal_table_rva.get(base_address);
-        Some(unsafe { export_ordinal_table.ordinals.get_unchecked(index) })
+        Some(unsafe { &*export_ordinal_table.ordinals.as_ptr().add(index) })
     }
     // Enumerates the ExportNamePtrTable looking for a String match with the provided name, gets
     // the ExportNamePtrTable using the provided base_address, similar to how we get the tables in
@@ -395,7 +395,7 @@ impl ExportDirectoryTable {
         let export_name_ptr_table = self.name_ptr_rva.get(base_address);
         for i in 0..self.number_of_names {
             let export_name_ptr =
-                unsafe { export_name_ptr_table.name_ptr.get_unchecked(i as usize) };
+                unsafe { &*export_name_ptr_table.name_ptr.as_ptr().add(i as usize) };
             let export_name = export_name_ptr.get(base_address);
             if export_name.to_string().to_lowercase() == name.to_lowercase() {
                 return Some(OrdinalTableIndex(i));
